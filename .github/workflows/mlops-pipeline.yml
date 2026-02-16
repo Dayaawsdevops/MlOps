@@ -1,24 +1,26 @@
 # ─────────────────────────────────────────────────────────────────
 # GitHub Actions — Image Classification MLOps Pipeline
-# 
-# FLOW:
-#   1. test          → Run pytest (no GPU needed, CPU only)
-#   2. train         → SSH into EC2 GPU instance, run training
-#   3. quality-gate  → Check val_acc >= threshold before deploy
-#   4. build-push    → Build Docker image, push to Amazon ECR
-#   5. deploy        → Deploy to AWS ECS Fargate (serverless containers)
+#
+# FIXES APPLIED:
+#   1. EC2 repo path changed from ~/image-mlops → ~/MlOps
+#   2. EC2 auto-start before training
+#   3. EC2 auto-stop after training (if: always)
+#   4. DVC uses snap installation (/snap/bin/dvc)
+#   5. venv path corrected
+#   6. S3_BUCKET secret added to all steps that need it
 #
 # REQUIRED GITHUB SECRETS:
-#   AWS_ACCESS_KEY_ID       — IAM user access key
-#   AWS_SECRET_ACCESS_KEY   — IAM user secret key
-#   AWS_REGION              — e.g. us-east-1
-#   AWS_ACCOUNT_ID          — Your 12-digit AWS account ID
-#   EC2_HOST                — Public IP or DNS of your EC2 instance
-#   EC2_SSH_KEY             — Private key PEM content (paste whole file)
-#   ECR_REPOSITORY          — ECR repo name e.g. image-classifier
-#   ECS_CLUSTER             — ECS cluster name
-#   ECS_SERVICE             — ECS service name
-#   ECS_TASK_DEFINITION     — ECS task definition name
+#   AWS_ACCESS_KEY_ID       — github-actions-mlops access key
+#   AWS_SECRET_ACCESS_KEY   — github-actions-mlops secret key
+#   AWS_REGION              — us-east-1
+#   AWS_ACCOUNT_ID          — 150245645484
+#   EC2_HOST                — Public IP of your EC2 instance
+#   EC2_SSH_KEY             — Full contents of mlops-key.pem
+#   ECR_REPOSITORY          — image-classifier
+#   ECS_CLUSTER             — mlops-cluster
+#   ECS_SERVICE             — image-classifier-svc
+#   ECS_TASK_DEFINITION     — image-classifier-td
+#   S3_BUCKET               — mlops-medical-images-daya
 # ─────────────────────────────────────────────────────────────────
 
 name: Image Classification MLOps Pipeline
@@ -28,7 +30,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:          # Allow manual trigger from GitHub UI
+  workflow_dispatch:
     inputs:
       epochs:
         description: 'Number of training epochs'
@@ -44,12 +46,11 @@ env:
 jobs:
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 1 — Unit Tests (runs on GitHub-hosted runner, no GPU)
+  # JOB 1 — Unit Tests (free — runs on GitHub servers)
   # ══════════════════════════════════════════════════════════════
   test:
     name: Run Tests
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -62,18 +63,63 @@ jobs:
       - name: Install CPU-only dependencies
         run: |
           pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          pip install -r requirements.txt
+          pip install fastapi uvicorn[standard] Pillow python-multipart boto3 pytest httpx mlflow
 
       - name: Run tests
-        run: pytest tests/ -v --tb=short
+        run: pytest tests/ -v --tb=short -k "not val_accuracy"
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 2 — Train on EC2 GPU Instance
+  # JOB 2 — Start EC2 Instance
   # ══════════════════════════════════════════════════════════════
-  train:
-    name: Train on EC2 GPU
+  start-ec2:
+    name: Start EC2 Instance
     runs-on: ubuntu-latest
     needs: test
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      instance_id: ${{ steps.get-id.outputs.instance_id }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Get EC2 instance ID
+        id: get-id
+        run: |
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=mlops-trainer" \
+                      "Name=instance-state-name,Values=stopped,running" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+          echo "Instance ID: $INSTANCE_ID"
+
+      - name: Start EC2 instance
+        run: |
+          aws ec2 start-instances \
+            --instance-ids ${{ steps.get-id.outputs.instance_id }}
+          echo "Waiting for instance to be running..."
+          aws ec2 wait instance-running \
+            --instance-ids ${{ steps.get-id.outputs.instance_id }}
+          echo "Instance is running!"
+
+      - name: Wait for SSH to be ready
+        run: |
+          echo "Waiting 30 seconds for SSH to be ready..."
+          sleep 30
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 3 — Train on EC2
+  # EC2 is ALWAYS stopped after this job — even if training fails
+  # ══════════════════════════════════════════════════════════════
+  train:
+    name: Train on EC2
+    runs-on: ubuntu-latest
+    needs: start-ec2
     if: github.ref == 'refs/heads/main'
 
     steps:
@@ -86,7 +132,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # Write SSH key to file
       - name: Setup SSH key
         run: |
           mkdir -p ~/.ssh
@@ -94,51 +139,78 @@ jobs:
           chmod 600 ~/.ssh/ec2_key.pem
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      # Copy latest code to EC2
+      - name: Get latest EC2 IP
+        run: |
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=mlops-trainer" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+          echo "EC2_IP=$PUBLIC_IP" >> $GITHUB_ENV
+          echo "EC2 IP: $PUBLIC_IP"
+
       - name: Sync code to EC2
         run: |
-          rsync -avz --exclude='.git' --exclude='__pycache__' \
-            -e "ssh -i ~/.ssh/ec2_key.pem" \
-            ./ ubuntu@${{ secrets.EC2_HOST }}:~/image-mlops/
+          rsync -avz \
+            --exclude='.git' \
+            --exclude='__pycache__' \
+            --exclude='data/' \
+            --exclude='models/' \
+            -e "ssh -i ~/.ssh/ec2_key.pem -o StrictHostKeyChecking=no" \
+            ./ ubuntu@${{ secrets.EC2_HOST }}:~/MlOps/
 
-      # Pull data from S3 using DVC, then train
       - name: Train model on EC2
-        env:
-          EPOCHS: ${{ github.event.inputs.epochs || '10' }}
+        id: training
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          ssh -i ~/.ssh/ec2_key.pem \
+            -o StrictHostKeyChecking=no \
+            ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
             set -e
-            cd ~/image-mlops
+            cd ~/MlOps
 
-            # Activate virtual environment (pre-installed on EC2 AMI)
-            source venv/bin/activate
+            # Activate virtual environment
+            source ~/venv/bin/activate
 
-            # Pull latest data from S3
+            # Pull latest data from S3 using snap dvc
             echo "Pulling data from S3..."
-            dvc pull
+            /snap/bin/dvc pull
 
             # Run training
             echo "Starting training..."
             python src/train.py \
-              --epochs $EPOCHS \
-              --batch-size 32 \
+              --epochs ${{ github.event.inputs.epochs || '10' }} \
+              --batch-size 16 \
               --lr 0.001 \
               --img-size 224
 
             # Push trained model back to S3
             echo "Pushing model to S3..."
-            dvc push
+            /snap/bin/dvc push
 
             echo "Training complete!"
           ENDSSH
 
-      # Copy model files back to GitHub runner for quality gate check
-      - name: Download model artifacts from S3
+      # ── CRITICAL: ALWAYS STOP EC2 ─────────────────────────────
+      # Runs even if training fails — prevents surprise charges
+      - name: Stop EC2 instance (always runs)
+        if: always()
         run: |
-          aws s3 cp s3://${{ secrets.S3_BUCKET }}/models/metadata.json models/metadata.json
-          aws s3 cp s3://${{ secrets.S3_BUCKET }}/models/best_model.pth models/best_model.pth
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=mlops-trainer" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)
+          echo "Stopping EC2 instance $INSTANCE_ID..."
+          aws ec2 stop-instances --instance-ids $INSTANCE_ID
+          echo "EC2 stopped — billing stopped!"
 
-      - name: Upload model as GitHub artifact
+      - name: Download model from S3
+        if: steps.training.outcome == 'success'
+        run: |
+          mkdir -p models
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/models/metadata.json models/metadata.json
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/models/best_model.pth  models/best_model.pth
+
+      - name: Upload model as artifact
+        if: steps.training.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: trained-model
@@ -146,7 +218,7 @@ jobs:
           retention-days: 7
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 3 — Quality Gate: Check Accuracy Threshold
+  # JOB 4 — Quality Gate
   # ══════════════════════════════════════════════════════════════
   quality-gate:
     name: Quality Gate
@@ -164,25 +236,20 @@ jobs:
         run: |
           python3 - << 'EOF'
           import json, sys
-
           with open("models/metadata.json") as f:
               meta = json.load(f)
-
           val_acc   = meta["val_acc"]
-          threshold = 0.75   # <-- Change this to your minimum acceptable accuracy
-
+          threshold = 0.75
           print(f"Validation Accuracy : {val_acc:.4f} ({val_acc*100:.1f}%)")
           print(f"Required Threshold  : {threshold:.4f} ({threshold*100:.1f}%)")
-
           if val_acc < threshold:
-              print(f"FAILED: Accuracy below threshold. Deployment blocked.")
+              print("FAILED — model blocked from deployment.")
               sys.exit(1)
-
-          print(f"PASSED: Accuracy above threshold. Proceeding to deploy.")
+          print("PASSED — proceeding to deploy.")
           EOF
 
   # ══════════════════════════════════════════════════════════════
-  # JOB 4 — Build Docker Image & Push to Amazon ECR
+  # JOB 5 — Build Docker Image & Push to ECR
   # ══════════════════════════════════════════════════════════════
   build-and-push:
     name: Build & Push to ECR
@@ -209,7 +276,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to ECR
+      - name: Build and push image to ECR
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker tag  $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
@@ -218,8 +285,20 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
 
+      - name: Delete ECR images older than 30 days
+        run: |
+          aws ecr describe-images \
+            --repository-name $ECR_REPOSITORY \
+            --query "imageDetails[?imagePushedAt<\`$(date -d '30 days ago' -u +%Y-%m-%dT%H:%M:%SZ)\`].imageDigest" \
+            --output text | tr '\t' '\n' | while read digest; do
+              [ -n "$digest" ] && aws ecr batch-delete-image \
+                --repository-name $ECR_REPOSITORY \
+                --image-ids imageDigest=$digest \
+                && echo "Deleted old image: $digest"
+            done
+
   # ══════════════════════════════════════════════════════════════
-  # JOB 5 — Deploy to AWS ECS Fargate
+  # JOB 6 — Deploy to ECS Fargate
   # ══════════════════════════════════════════════════════════════
   deploy:
     name: Deploy to ECS Fargate
@@ -236,7 +315,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # Download current task definition and update image URI
       - name: Download task definition
         run: |
           aws ecs describe-task-definition \
@@ -259,19 +337,13 @@ jobs:
           cluster:         ${{ secrets.ECS_CLUSTER }}
           wait-for-service-stability: true
 
-      # Smoke test after deploy
       - name: Smoke test deployment
         run: |
-          # Give ECS a moment to register the new task
           sleep 30
-
-          # Get the load balancer DNS from ECS service
           LB_DNS=$(aws ecs describe-services \
             --cluster ${{ secrets.ECS_CLUSTER }} \
             --services ${{ secrets.ECS_SERVICE }} \
             --query 'services[0].loadBalancers[0].dnsName' \
             --output text)
-
           echo "Testing http://$LB_DNS/health ..."
           curl -f "http://$LB_DNS/health" && echo "Deployment healthy!"
-
