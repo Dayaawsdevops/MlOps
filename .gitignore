@@ -1,0 +1,21 @@
+# Data — tracked by DVC not Git
+data/images/
+data/*.csv
+
+# Model weights — tracked by DVC not Git
+models/best_model.pth
+models/metadata.json
+
+# MLflow runs — local only
+mlruns/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets — NEVER commit these
+.env
+kaggle.json
+*.pem
