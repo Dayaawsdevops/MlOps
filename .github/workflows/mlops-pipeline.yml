@@ -1,0 +1,277 @@
+# ─────────────────────────────────────────────────────────────────
+# GitHub Actions — Image Classification MLOps Pipeline
+# 
+# FLOW:
+#   1. test          → Run pytest (no GPU needed, CPU only)
+#   2. train         → SSH into EC2 GPU instance, run training
+#   3. quality-gate  → Check val_acc >= threshold before deploy
+#   4. build-push    → Build Docker image, push to Amazon ECR
+#   5. deploy        → Deploy to AWS ECS Fargate (serverless containers)
+#
+# REQUIRED GITHUB SECRETS:
+#   AWS_ACCESS_KEY_ID       — IAM user access key
+#   AWS_SECRET_ACCESS_KEY   — IAM user secret key
+#   AWS_REGION              — e.g. us-east-1
+#   AWS_ACCOUNT_ID          — Your 12-digit AWS account ID
+#   EC2_HOST                — Public IP or DNS of your EC2 instance
+#   EC2_SSH_KEY             — Private key PEM content (paste whole file)
+#   ECR_REPOSITORY          — ECR repo name e.g. image-classifier
+#   ECS_CLUSTER             — ECS cluster name
+#   ECS_SERVICE             — ECS service name
+#   ECS_TASK_DEFINITION     — ECS task definition name
+# ─────────────────────────────────────────────────────────────────
+
+name: Image Classification MLOps Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:          # Allow manual trigger from GitHub UI
+    inputs:
+      epochs:
+        description: 'Number of training epochs'
+        required: false
+        default: '10'
+
+env:
+  AWS_REGION:      ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY:    ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  ECR_REPOSITORY:  ${{ secrets.ECR_REPOSITORY }}
+  IMAGE_TAG:       ${{ github.sha }}
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 1 — Unit Tests (runs on GitHub-hosted runner, no GPU)
+  # ══════════════════════════════════════════════════════════════
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CPU-only dependencies
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 2 — Train on EC2 GPU Instance
+  # ══════════════════════════════════════════════════════════════
+  train:
+    name: Train on EC2 GPU
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # Write SSH key to file
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
+          chmod 600 ~/.ssh/ec2_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      # Copy latest code to EC2
+      - name: Sync code to EC2
+        run: |
+          rsync -avz --exclude='.git' --exclude='__pycache__' \
+            -e "ssh -i ~/.ssh/ec2_key.pem" \
+            ./ ubuntu@${{ secrets.EC2_HOST }}:~/image-mlops/
+
+      # Pull data from S3 using DVC, then train
+      - name: Train model on EC2
+        env:
+          EPOCHS: ${{ github.event.inputs.epochs || '10' }}
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e
+            cd ~/image-mlops
+
+            # Activate virtual environment (pre-installed on EC2 AMI)
+            source venv/bin/activate
+
+            # Pull latest data from S3
+            echo "Pulling data from S3..."
+            dvc pull
+
+            # Run training
+            echo "Starting training..."
+            python src/train.py \
+              --epochs $EPOCHS \
+              --batch-size 32 \
+              --lr 0.001 \
+              --img-size 224
+
+            # Push trained model back to S3
+            echo "Pushing model to S3..."
+            dvc push
+
+            echo "Training complete!"
+          ENDSSH
+
+      # Copy model files back to GitHub runner for quality gate check
+      - name: Download model artifacts from S3
+        run: |
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/models/metadata.json models/metadata.json
+          aws s3 cp s3://${{ secrets.S3_BUCKET }}/models/best_model.pth models/best_model.pth
+
+      - name: Upload model as GitHub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: models/
+          retention-days: 7
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 3 — Quality Gate: Check Accuracy Threshold
+  # ══════════════════════════════════════════════════════════════
+  quality-gate:
+    name: Quality Gate
+    runs-on: ubuntu-latest
+    needs: train
+
+    steps:
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: models/
+
+      - name: Check accuracy threshold
+        run: |
+          python3 - << 'EOF'
+          import json, sys
+
+          with open("models/metadata.json") as f:
+              meta = json.load(f)
+
+          val_acc   = meta["val_acc"]
+          threshold = 0.75   # <-- Change this to your minimum acceptable accuracy
+
+          print(f"Validation Accuracy : {val_acc:.4f} ({val_acc*100:.1f}%)")
+          print(f"Required Threshold  : {threshold:.4f} ({threshold*100:.1f}%)")
+
+          if val_acc < threshold:
+              print(f"FAILED: Accuracy below threshold. Deployment blocked.")
+              sys.exit(1)
+
+          print(f"PASSED: Accuracy above threshold. Proceeding to deploy.")
+          EOF
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 4 — Build Docker Image & Push to Amazon ECR
+  # ══════════════════════════════════════════════════════════════
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: quality-gate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download trained model
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model
+          path: models/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to ECR
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag  $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+                      $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  # ══════════════════════════════════════════════════════════════
+  # JOB 5 — Deploy to AWS ECS Fargate
+  # ══════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to ECS Fargate
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # Download current task definition and update image URI
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ secrets.ECS_TASK_DEFINITION }} \
+            --query taskDefinition > task-def.json
+
+      - name: Update ECS task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name:  image-classifier
+          image:           ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      - name: Deploy to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service:         ${{ secrets.ECS_SERVICE }}
+          cluster:         ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      # Smoke test after deploy
+      - name: Smoke test deployment
+        run: |
+          # Give ECS a moment to register the new task
+          sleep 30
+
+          # Get the load balancer DNS from ECS service
+          LB_DNS=$(aws ecs describe-services \
+            --cluster ${{ secrets.ECS_CLUSTER }} \
+            --services ${{ secrets.ECS_SERVICE }} \
+            --query 'services[0].loadBalancers[0].dnsName' \
+            --output text)
+
+          echo "Testing http://$LB_DNS/health ..."
+          curl -f "http://$LB_DNS/health" && echo "Deployment healthy!"
+
